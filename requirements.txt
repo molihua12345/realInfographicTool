@@ -1,0 +1,30 @@
+# Core dependencies
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+selenium>=4.15.0
+Pillow>=10.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Image processing and similarity
+imagehash>=4.3.1
+opencv-python>=4.8.0
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.35.0
+# CLIP model - using git version to avoid 0.2.0 compatibility issues
+git+https://github.com/openai/CLIP.git
+
+# API clients
+openai>=1.3.0
+google-generativeai>=0.3.0
+
+# Utilities
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+pyyaml>=6.0
+click>=8.1.0
+
+# Web driver
+webdriver-manager>=4.0.0
