@@ -12,6 +12,7 @@ import pandas as pd
 from tqdm import tqdm
 import openai
 import google.generativeai as genai
+from datetime import datetime
 
 from .utils import rate_limit_delay
 
@@ -35,6 +36,11 @@ class DataExtractor:
         self.extracted_data_dir.mkdir(parents=True, exist_ok=True)
         self.human_annotation_dir.mkdir(parents=True, exist_ok=True)
         
+        # 设置AI回复日志文件路径
+        logs_dir = base_dir / self.storage_config['subdirs']['logs']
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        self.ai_response_log_file = logs_dir / "ai_responses.log"
+        
         # 初始化API客户端
         self._setup_api_clients()
         
@@ -50,13 +56,19 @@ class DataExtractor:
     
     def _setup_api_clients(self) -> None:
         """设置API客户端"""
-        # OpenAI客户端
-        openai_key = self.api_config.get('openai', {}).get('api_key')
-        if openai_key and openai_key != "your_openai_api_key_here":
-            openai.api_key = openai_key
-            base_url = self.api_config.get('openai', {}).get('base_url')
-            if base_url:
-                openai.base_url = base_url
+        # 通义千问客户端
+        qwen_config = self.api_config.get('qwen', {})
+        api_key = qwen_config.get('api_key')
+        
+        if api_key and api_key != "your_qwen_api_key_here":
+            # 使用通义千问兼容模式端点
+            base_url = qwen_config.get('base_url', "https://dashscope.aliyuncs.com/compatible-mode/v1")
+            self.qwen_client = openai.OpenAI(
+                api_key=api_key,
+                base_url=base_url
+            )
+        else:
+            self.qwen_client = None
         
         # Google AI客户端
         google_key = self.api_config.get('google', {}).get('api_key')
@@ -131,7 +143,7 @@ class DataExtractor:
         consensus_result = self._check_consensus(primary_results)
         
         if consensus_result:
-            # 达成一致
+            # 达成一致且有有效数据
             self.stats['consensus_achieved'] += 1
             result = {
                 'image_path': str(image_path),
@@ -143,7 +155,8 @@ class DataExtractor:
             # 步骤3: 使用仲裁模型
             arbitrator_result = self._extract_with_arbitrator(image_base64, primary_results)
             
-            if arbitrator_result:
+            if arbitrator_result and self._has_valid_data(arbitrator_result):
+                # 仲裁模型提取到有效数据
                 self.stats['arbitrator_used'] += 1
                 result = {
                     'image_path': str(image_path),
@@ -152,9 +165,14 @@ class DataExtractor:
                     'confidence': 'medium'
                 }
             else:
-                # 步骤4: 需要人工标注
+                # 步骤4: 需要人工标注（仲裁模型也未提取到有效数据）
+                if arbitrator_result and not self._has_valid_data(arbitrator_result):
+                    logger.info(f"仲裁模型未提取到有效数据，转入人工标注: {image_path}")
+                else:
+                    logger.info(f"仲裁模型提取失败，转入人工标注: {image_path}")
+                
                 self.stats['human_annotation_needed'] += 1
-                result = self._prepare_for_human_annotation(image_path, primary_results)
+                result = self._prepare_for_human_annotation(image_path, primary_results, arbitrator_result)
         
         # 保存单个结果
         self._save_single_result(image_path, result)
@@ -194,8 +212,8 @@ class DataExtractor:
         
         for model_config in self.extraction_config['models']['primary']:
             try:
-                if model_config['provider'] == 'openai':
-                    result = self._extract_with_openai(model_config['name'], image_base64)
+                if model_config['provider'] == 'qwen':
+                    result = self._extract_with_qwen(model_config['name'], image_base64)
                 elif model_config['provider'] == 'google':
                     result = self._extract_with_google(model_config['name'], image_base64)
                 else:
@@ -214,12 +232,16 @@ class DataExtractor:
         
         return results
     
-    def _extract_with_openai(self, model_name: str, image_base64: str) -> Optional[Dict[str, Any]]:
-        """使用OpenAI模型提取数据"""
+    def _extract_with_qwen(self, model_name: str, image_base64: str) -> Optional[Dict[str, Any]]:
+        """使用通义千问模型提取数据"""
+        if not self.qwen_client:
+            logger.warning("通义千问客户端未配置，跳过通义千问提取")
+            return None
+            
         try:
             prompt = self._get_extraction_prompt()
             
-            response = openai.chat.completions.create(
+            response = self.qwen_client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {
@@ -240,10 +262,12 @@ class DataExtractor:
             )
             
             content = response.choices[0].message.content
+            # 记录AI回复到日志文件
+            self._log_ai_response(model_name, "qwen", content)
             return self._parse_extraction_result(content)
             
         except Exception as e:
-            logger.error(f"OpenAI提取失败: {e}")
+            logger.error(f"通义千问提取失败: {e}")
             return None
     
     def _extract_with_google(self, model_name: str, image_base64: str) -> Optional[Dict[str, Any]]:
@@ -265,6 +289,8 @@ class DataExtractor:
                 )
             )
             
+            # 记录AI回复到日志文件
+            self._log_ai_response(model_name, "google", response.text)
             return self._parse_extraction_result(response.text)
             
         except Exception as e:
@@ -283,8 +309,8 @@ class DataExtractor:
     "tables": [
         {
             "table_title": "表格标题",
-            "headers": ["列标题1", "列标题2", ...],
-            "rows": [
+            "data": [
+                ["列标题1", "列标题2", ...],
                 ["数据1", "数据2", ...],
                 ["数据1", "数据2", ...]
             ],
@@ -297,11 +323,30 @@ class DataExtractor:
 }
 
 注意事项：
-1. 如果图片中没有明确的表格数据，请在tables字段中返回空数组
-2. 尽量保持数据的原始格式和精度
-3. 如果某些信息不可见或不确定，请标注为"N/A"
-4. 只返回JSON格式的结果，不要包含其他文字说明
+1. data字段是一个二维数组，第一行为表头（列标题），后续行为数据行
+2. 如果图片中没有明确的表格数据，请在tables字段中返回空数组
+3. 尽量保持数据的原始格式和精度
+4. 如果某些信息不可见或不确定，请标注为"N/A"
+5. 只返回JSON格式的结果，不要包含其他文字说明
 """
+    
+    def _log_ai_response(self, model_name: str, provider: str, response_content: str) -> None:
+        """记录AI回复到日志文件"""
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_entry = f"\n{'='*80}\n"
+            log_entry += f"时间: {timestamp}\n"
+            log_entry += f"模型: {model_name} ({provider})\n"
+            log_entry += f"{'='*80}\n"
+            log_entry += f"回复内容:\n{response_content}\n"
+            log_entry += f"{'='*80}\n"
+            
+            # 追加写入日志文件
+            with open(self.ai_response_log_file, 'a', encoding='utf-8') as f:
+                f.write(log_entry)
+                
+        except Exception as e:
+            logger.error(f"记录AI回复日志失败: {e}")
     
     def _parse_extraction_result(self, content: str) -> Optional[Dict[str, Any]]:
         """解析提取结果"""
@@ -327,19 +372,56 @@ class DataExtractor:
             logger.error(f"解析提取结果失败: {e}")
             return None
     
+    def _has_valid_data(self, result: Dict[str, Any]) -> bool:
+        """检查提取结果是否包含有效数据"""
+        if not result:
+            return False
+        
+        tables = result.get('tables', [])
+        if not tables:
+            return False
+        
+        # 检查是否至少有一个表格包含有效数据
+        for table in tables:
+            data = table.get('data', [])
+            if data and len(data) > 1:  # 至少有表头和一行数据
+                # 检查是否有非空的数据行
+                for row in data[1:]:  # 跳过表头
+                    if any(str(cell).strip() for cell in row):  # 至少有一个非空单元格
+                        return True
+        
+        return False
+    
     def _check_consensus(self, results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """检查模型结果一致性"""
         if len(results) < 2:
             return None
         
-        # 简单的一致性检查：比较表格数量和基本结构
         first_result = results[0]['data']
         
-        for result in results[1:]:
-            if not self._compare_extraction_results(first_result, result['data']):
-                return None
+        # 检查第一个结果是否有有效数据
+        first_has_data = self._has_valid_data(first_result)
         
-        # 如果达成一致，返回第一个结果
+        # 比较所有结果
+        for result in results[1:]:
+            current_result = result['data']
+            current_has_data = self._has_valid_data(current_result)
+            
+            # 如果数据有效性不一致，无法达成一致
+            if first_has_data != current_has_data:
+                return None
+            
+            # 如果都有数据，比较结构
+            if first_has_data and current_has_data:
+                if not self._compare_extraction_results(first_result, current_result):
+                    return None
+        
+        # 如果所有结果都没有有效数据，返回None（需要仲裁）
+        if not first_has_data:
+            logger.info("所有主要模型都未提取到有效数据，转入仲裁流程")
+            return None
+        
+        # 如果达成一致且有有效数据，返回第一个结果
         return first_result
     
     def _compare_extraction_results(self, result1: Dict[str, Any], result2: Dict[str, Any]) -> bool:
@@ -356,14 +438,17 @@ class DataExtractor:
         
         # 比较每个表格的结构
         for table1, table2 in zip(tables1, tables2):
-            headers1 = table1.get('headers', [])
-            headers2 = table2.get('headers', [])
-            rows1 = table1.get('rows', [])
-            rows2 = table2.get('rows', [])
+            data1 = table1.get('data', [])
+            data2 = table2.get('data', [])
             
-            # 检查列数和行数
-            if len(headers1) != len(headers2) or len(rows1) != len(rows2):
+            # 检查数据行数和列数
+            if len(data1) != len(data2):
                 return False
+            
+            # 检查每行的列数
+            for row1, row2 in zip(data1, data2):
+                if len(row1) != len(row2):
+                    return False
         
         return True
     
@@ -372,8 +457,8 @@ class DataExtractor:
         arbitrator_config = self.extraction_config['models']['arbitrator']
         
         try:
-            if arbitrator_config['provider'] == 'openai':
-                return self._extract_with_openai(arbitrator_config['name'], image_base64)
+            if arbitrator_config['provider'] == 'qwen':
+                return self._extract_with_qwen(arbitrator_config['name'], image_base64)
             elif arbitrator_config['provider'] == 'google':
                 return self._extract_with_google(arbitrator_config['name'], image_base64)
             else:
@@ -384,7 +469,7 @@ class DataExtractor:
             logger.error(f"仲裁模型提取失败: {e}")
             return None
     
-    def _prepare_for_human_annotation(self, image_path: Path, primary_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _prepare_for_human_annotation(self, image_path: Path, primary_results: List[Dict[str, Any]], arbitrator_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """准备人工标注"""
         # 复制图片到人工标注目录
         annotation_image_path = self.human_annotation_dir / image_path.name
@@ -396,8 +481,9 @@ class DataExtractor:
             'image_path': str(annotation_image_path),
             'original_path': str(image_path),
             'primary_results': primary_results,
+            'arbitrator_result': arbitrator_result,
             'status': 'pending',
-            'instructions': '请人工提取此图片中的表格数据，参考AI模型的提取结果'
+            'instructions': '请人工提取此图片中的表格数据，参考AI模型的提取结果。注意：所有AI模型都未能提取到有效数据或提取结果不一致。'
         }
         
         task_file = self.human_annotation_dir / f"{image_path.stem}_task.json"
@@ -442,14 +528,18 @@ class DataExtractor:
             for result in results:
                 if result.get('data') and result['data'].get('tables'):
                     for i, table in enumerate(result['data']['tables']):
+                        data_array = table.get('data', [])
+                        headers = data_array[0] if len(data_array) > 0 else []
+                        rows = data_array[1:] if len(data_array) > 1 else []
+                        
                         table_data = {
                             'image_path': result['image_path'],
                             'extraction_method': result['extraction_method'],
                             'confidence': result['confidence'],
                             'table_index': i,
                             'table_title': table.get('table_title', ''),
-                            'headers': json.dumps(table.get('headers', []), ensure_ascii=False),
-                            'rows': json.dumps(table.get('rows', []), ensure_ascii=False),
+                            'headers': json.dumps(headers, ensure_ascii=False),
+                            'rows': json.dumps(rows, ensure_ascii=False),
                             'units': table.get('units', ''),
                             'notes': table.get('notes', '')
                         }
