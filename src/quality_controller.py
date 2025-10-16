@@ -58,6 +58,10 @@ class QualityController:
         if input_dir is None:
             input_dir = self.raw_images_dir
         
+        # 确保input_dir是Path对象
+        if isinstance(input_dir, str):
+            input_dir = Path(input_dir)
+        
         logger.info(f"开始质量控制处理，输入目录: {input_dir}")
         
         # 获取所有图片文件

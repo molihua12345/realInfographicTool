@@ -68,6 +68,10 @@ class DataExtractor:
         if input_dir is None:
             input_dir = self.processed_images_dir
         
+        # 确保input_dir是Path对象
+        if isinstance(input_dir, str):
+            input_dir = Path(input_dir)
+        
         logger.info(f"开始数据提取，输入目录: {input_dir}")
         
         # 获取所有图片文件
